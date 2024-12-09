@@ -1,0 +1,11 @@
+dotenv
+langchain-google-vertexai
+langchain-text-splitters
+langchain-community
+langchain-nvidia-ai-endpoints
+langchain-community
+langchain-chroma
+langgraph
+beautifulsoup4
+tiktoken
+pypdf
