@@ -3,3 +3,6 @@
 
 #ignoring the env file
 .env
+
+#ignore local chromadb store
+chroma_db
