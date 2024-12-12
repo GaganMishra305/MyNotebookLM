@@ -1,150 +1,171 @@
-import os
-import tempfile
 import streamlit as st
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
-from langchain_community.document_loaders import PyPDFLoader
+from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain.chains import RetrievalQA
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_nvidia_ai_endpoints import NVIDIAEmbeddings
-import chromadb
-
-chromadb.api.client.SharedSystemClient.clear_system_cache()
-
-# Ensure the database directory exists
-DB_DIR = "./chroma_db"
-os.makedirs(DB_DIR, exist_ok=True)
-
-# Streamlit app configuration
-st.set_page_config(page_title="PDF Chatbot", page_icon="📚", layout="wide")
-
-# Initialize session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
-
-# Cached model initialization
-@st.cache_resource
-def get_chat_model():
-    return ChatNVIDIA(model="meta/llama-3.1-8b-instruct")
+from langchain_community.llms import CTransformers
+from langchain.vectorstores import FAISS
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from sentence_transformers import SentenceTransformer, util
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain.chains import create_history_aware_retriever
+from langchain_huggingface import HuggingFaceEmbeddings
 
 @st.cache_resource
-def get_embedding_model():
-    return NVIDIAEmbeddings(model="NV-Embed-QA")
-
-
-# PDF Processing Function
-def process_pdf(uploaded_file):
-    # Create a temporary file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(uploaded_file.getvalue())
-        tmp_file_path = tmp_file.name
-
-    # Load and split PDF
-    loader = PyPDFLoader(tmp_file_path)
-    documents = loader.load()
-    
-    # Split documents
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500, 
-        chunk_overlap=100
-    )
-    splits = text_splitter.split_documents(documents)
-    
-    # Create vector store
-    embedding_model = get_embedding_model()
-    vectorstore = Chroma.from_documents(
-        documents=splits, 
-        embedding=embedding_model, 
-        persist_directory=DB_DIR
-    )
-    
-    # Clean up temporary file
-    os.unlink(tmp_file_path)
-    
-    return vectorstore
-
-# Streamlit App UI
-st.title("📚 PDF Chatbot")
-
-# Sidebar for PDF Upload
-with st.sidebar:
-    st.header("Upload PDF")
-    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
-    
-    if uploaded_file is not None:
-        with st.spinner("Processing PDF..."):
-            st.session_state.vectorstore = process_pdf(uploaded_file)
-            st.success("PDF processed successfully!")
-
-# Chat Interface
-if st.session_state.vectorstore:
-    # Initialize LLM and QA Chain
-    llm = get_chat_model()
-    retriever = st.session_state.vectorstore.as_retriever(
-        search_kwargs={"k": 3}  # Return top 3 most relevant chunks
-    )
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm, 
-        chain_type="stuff", 
-        retriever=retriever,
-        return_source_documents=True
+def get_llm():
+    return CTransformers(
+        model='Models/llama-2-7b-chat.ggmlv3.q8_0.bin',
+        model_type='llama',
+        config={
+            'max_new_tokens': 512,
+        }
     )
 
-    # Display chat messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    # User input
-    if prompt := st.chat_input("Ask a question about the PDF"):
-        # Add user message to chat history
-        st.session_state.messages.append({"role": "user", "content": prompt})
+def prepare_and_split_docs(pdf_directory):
+    split_docs = []
+    for pdf in pdf_directory:
+        with open(pdf.name, "wb") as f:
+            f.write(pdf.getbuffer())
         
-        # Display user message
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        
-        # Generate response
-        with st.chat_message("assistant"):
-            with st.spinner("Searching document and generating response..."):
-                try:
-                    # Run QA chain
-                    response = qa_chain({"query": prompt})
-                    full_response = response['result']
-                    
-                    # Display response
-                    st.markdown(full_response)
-                    
-                    # Optional: Show source documents
-                    with st.expander("Source Documents"):
-                        for doc in response['source_documents']:
-                            st.write(f"Page {doc.metadata.get('page', 'N/A')}: {doc.page_content[:300]}...")
-                    
-                    # Add to message history
-                    st.session_state.messages.append({
-                        "role": "assistant", 
-                        "content": full_response
-                    })
-                
-                except Exception as e:
-                    st.error(f"An error occurred: {e}")
-else:
-    st.info("Please upload a PDF file in the sidebar to start chatting.")
+        loader = PyPDFLoader(pdf.name)
+        documents = loader.load()
+        splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+            chunk_size=1024,
+            chunk_overlap=512,
+            disallowed_special=(),
+            separators=["\n\n", "\n", " ", ".", ","]
+        )
+        split_docs.extend(splitter.split_documents(documents))
+    return split_docs
 
-# Optional cleanup function if needed
-def clear_vectorstore():
-    st.session_state.vectorstore = None
-    st.session_state.messages = []
-    if os.path.exists(DB_DIR):
-        import shutil
-        shutil.rmtree(DB_DIR)
-    st.rerun()
+def ingest_into_vectordb(split_docs):
+    embeddings = HuggingFaceEmbeddings(model_name='sentence-transformers/all-MiniLM-L6-v2')
+    
+    db = FAISS.from_documents(split_docs, embeddings)
+    DB_FAISS_PATH = 'vectorstore/db_faiss'
+    db.save_local(DB_FAISS_PATH)
+    return db
 
-# Add a clear button in the sidebar
-with st.sidebar:
-    if st.button("Clear Uploaded Document"):
-        clear_vectorstore()
+def get_conversation_chain(retriever):
+    llm = get_llm()
+    
+    contextualize_q_system_prompt = (
+        "Provide a context-aware response based on chat history and the latest query. "
+        "Focus on the most relevant information from the documents."
+        "I you dont have a relevant response from context then answer it according to yourself"
+    )
+
+    contextualize_q_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", contextualize_q_system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+    history_aware_retriever = create_history_aware_retriever(
+        llm, retriever, contextualize_q_prompt
+    )
+
+    system_prompt = (
+        "As an AI assistant, provide a concise and accurate answer based on the document context. "
+        "Aim for clarity and relevance. Limit your response to the most important information. "
+        "{context}"
+    )
+
+    qa_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+    
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+
+    store = {}
+
+    def get_session_history(session_id: str) -> BaseChatMessageHistory:
+        if session_id not in store:
+            store[session_id] = ChatMessageHistory()
+        return store[session_id]
+
+    conversational_rag_chain = RunnableWithMessageHistory(
+        rag_chain,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="chat_history",
+        output_messages_key="answer",
+    )
+    return conversational_rag_chain
+
+def calculate_similarity_score(answer: str, context_docs: list) -> float:
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    context_docs = [doc.page_content for doc in context_docs]
+    
+    answer_embedding = model.encode(answer, convert_to_tensor=True)
+    context_embeddings = model.encode(context_docs, convert_to_tensor=True)
+
+    similarities = util.pytorch_cos_sim(answer_embedding, context_embeddings)
+    max_score = similarities.max().item() 
+    return max_score
+
+# Initialize session states
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+
+# Main Streamlit App
+st.title("Document Chat Assistant")
+
+# Sidebar for file upload
+st.sidebar.header("Upload Documents")
+uploaded_files = st.sidebar.file_uploader(
+    "Choose PDF files", 
+    type=["pdf"], 
+    accept_multiple_files=True
+)
+
+# Process Documents Button
+if uploaded_files:
+    if st.sidebar.button("Process Documents"):
+        with st.spinner("Processing documents..."):
+            split_docs = prepare_and_split_docs(uploaded_files)
+            vector_db = ingest_into_vectordb(split_docs)
+            retriever = vector_db.as_retriever(search_kwargs={"k": 3})
+            st.session_state.conversational_chain = get_conversation_chain(retriever)
+            st.sidebar.success("Documents processed successfully!")
+
+# Chat input
+user_input = st.text_input("Ask a question about your documents")
+
+# Submit button
+if st.button("Send"):
+    if user_input and 'conversational_chain' in st.session_state:
+        with st.spinner("Generating response..."):
+            session_id = "abc123"
+            conversational_chain = st.session_state.conversational_chain
+            response = conversational_chain.invoke(
+                {"input": user_input}, 
+                config={"configurable": {"session_id": session_id}}
+            )
+            
+            # Store response with context
+            st.session_state.chat_history.append({
+                "user": user_input, 
+                "bot": response['answer'], 
+                "context_docs": response.get('context', [])
+            })
+
+# Display chat history
+if 'chat_history' in st.session_state:
+    for index, message in enumerate(st.session_state.chat_history):
+        st.write(f"**You:** {message['user']}")
+        st.write(f"**Assistant:** {message['bot']}")
+
+        # Source documents expander
+        with st.expander(f"Source Documents (Message {index+1})"):
+            for doc in message.get('context_docs', []):
+                st.write(f"**Source:** {doc.metadata.get('source', 'Unknown')}")
+                st.write(doc.page_content)

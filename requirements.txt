@@ -5,7 +5,12 @@ langchain-community
 langchain-nvidia-ai-endpoints
 langchain-community
 langchain-chroma
+faiss-cpu
 langgraph
 beautifulsoup4
 tiktoken
 pypdf
+ctransformers
+sentence_transformers
+torch
+langchain_huggingface
