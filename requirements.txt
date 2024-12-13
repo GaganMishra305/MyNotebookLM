@@ -3,6 +3,8 @@ langchain-google-vertexai
 langchain-text-splitters
 langchain-community
 langchain-nvidia-ai-endpoints
+langchain_ollama
+gpt4all
 langchain-community
 langchain-chroma
 faiss-cpu
