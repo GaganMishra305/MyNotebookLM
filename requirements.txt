@@ -37,3 +37,4 @@ Pillow
 numpy
 pytesseract
 tesseract
+langchain_neo4j
